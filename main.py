@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QSplitter, QFrame,
     QHeaderView, QAbstractItemView,
     QMessageBox, QSizePolicy, QTabWidget,
+    QProgressBar, QFileDialog,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
@@ -225,6 +226,18 @@ QMessageBox, QDialog { background-color: #1e1e2e; }
 QToolTip {
     background-color: #313244; color: #cdd6f4;
     border: 1px solid #45475a; padding: 4px 8px; border-radius: 4px;
+}
+
+/* ── Progress bar ── */
+QProgressBar {
+    background-color: #313244;
+    border-radius: 3px;
+    border: none;
+    height: 6px;
+}
+QProgressBar::chunk {
+    background-color: #89b4fa;
+    border-radius: 3px;
 }
 """
 
@@ -489,6 +502,183 @@ class LoginWidget(QWidget):
         self.status_lbl.setText(f"❌  {err}")
 
 
+# ── Data Dictionary export worker ─────────────────────────────────────────────
+
+class DictExportWorker(QThread):
+    progress = pyqtSignal(int, int, str)   # current, total, table_name
+    finished = pyqtSignal(str)             # output path
+    error    = pyqtSignal(str)
+
+    def __init__(self, params: dict, schema: str, tables: list, path: str):
+        super().__init__()
+        self.params = params
+        self.schema = schema
+        self.tables = tables
+        self.path   = path
+
+    def run(self):
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        except ImportError:
+            self.error.emit(
+                "openpyxl is not installed.\nRun:  pip install openpyxl"
+            )
+            return
+
+        try:
+            conn = psycopg2.connect(
+                host=self.params["host"],
+                port=int(self.params["port"]),
+                dbname=self.params["database"],
+                user=self.params["user"],
+                password=self.params["password"],
+                connect_timeout=10,
+                application_name="pgbrowser_export",
+            )
+        except Exception as exc:
+            self.error.emit(f"Connection failed: {exc}")
+            return
+
+        try:
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)   # drop default empty sheet
+
+            hdr_font  = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+            hdr_fill  = PatternFill("solid", fgColor="1F3864")
+            hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            thin      = Side(style="thin", color="D9D9D9")
+            brd       = Border(left=thin, right=thin, top=thin, bottom=thin)
+            pk_fill   = PatternFill("solid", fgColor="FFF2CC")
+            fk_fill   = PatternFill("solid", fgColor="DEEAF1")
+
+            HEADERS    = [
+                "#", "Column Name", "Data Type", "UDT Name",
+                "Max Length", "Precision", "Scale",
+                "Nullable", "Default Value", "Constraints", "Description",
+            ]
+            COL_WIDTHS = [5, 25, 18, 18, 12, 12, 8, 10, 30, 18, 40]
+
+            for idx, table in enumerate(self.tables, 1):
+                self.progress.emit(idx, len(self.tables), table)
+
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                cur.execute("""
+                    SELECT
+                        c.ordinal_position,
+                        c.column_name,
+                        c.data_type,
+                        c.udt_name,
+                        c.character_maximum_length,
+                        c.numeric_precision,
+                        c.numeric_scale,
+                        c.is_nullable,
+                        c.column_default,
+                        COALESCE(STRING_AGG(DISTINCT
+                            CASE tc.constraint_type
+                                WHEN 'PRIMARY KEY' THEN 'PK'
+                                WHEN 'FOREIGN KEY' THEN 'FK'
+                                WHEN 'UNIQUE'      THEN 'UQ'
+                                ELSE NULL
+                            END, ', '), '') AS constraints,
+                        d.description
+                    FROM information_schema.columns c
+                    LEFT JOIN information_schema.key_column_usage kcu
+                        ON  c.table_schema = kcu.table_schema
+                        AND c.table_name   = kcu.table_name
+                        AND c.column_name  = kcu.column_name
+                    LEFT JOIN information_schema.table_constraints tc
+                        ON  kcu.constraint_name   = tc.constraint_name
+                        AND kcu.constraint_schema = tc.constraint_schema
+                        AND kcu.table_name        = tc.table_name
+                    LEFT JOIN pg_catalog.pg_description d
+                        ON  d.objoid = (
+                                SELECT oid FROM pg_class
+                                JOIN   pg_namespace
+                                       ON pg_namespace.oid = pg_class.relnamespace
+                                WHERE  pg_class.relname   = %s
+                                  AND  pg_namespace.nspname = %s
+                            )
+                        AND d.objsubid = c.ordinal_position
+                    WHERE c.table_schema = %s AND c.table_name = %s
+                    GROUP BY c.ordinal_position, c.column_name, c.data_type,
+                             c.udt_name, c.character_maximum_length,
+                             c.numeric_precision, c.numeric_scale,
+                             c.is_nullable, c.column_default, d.description
+                    ORDER BY c.ordinal_position
+                """, (table, self.schema, self.schema, table))
+                rows = cur.fetchall()
+
+                # Sheet name: max 31 chars, must be unique
+                sheet_name  = table[:31]
+                used_names  = {ws.title for ws in wb.worksheets}
+                if sheet_name in used_names:
+                    sheet_name = f"{table[:28]}_{idx}"
+
+                ws = wb.create_sheet(title=sheet_name)
+
+                # Title row
+                ws.merge_cells("A1:K1")
+                tc           = ws["A1"]
+                tc.value     = f"Data Dictionary — {self.schema}.{table}"
+                tc.font      = Font(name="Calibri", bold=True, size=13, color="1F3864")
+                tc.alignment = Alignment(horizontal="left", vertical="center")
+                ws.row_dimensions[1].height = 22
+
+                # Header row
+                for ci, (hdr, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
+                    cell            = ws.cell(row=2, column=ci, value=hdr)
+                    cell.font       = hdr_font
+                    cell.fill       = hdr_fill
+                    cell.alignment  = hdr_align
+                    cell.border     = brd
+                    ws.column_dimensions[cell.column_letter].width = w
+                ws.row_dimensions[2].height = 18
+
+                # Data rows
+                for ri, row in enumerate(rows, 3):
+                    constraints = row["constraints"] or ""
+                    vals = [
+                        row["ordinal_position"],
+                        row["column_name"],
+                        row["data_type"],
+                        row["udt_name"],
+                        row["character_maximum_length"],
+                        row["numeric_precision"],
+                        row["numeric_scale"],
+                        row["is_nullable"],
+                        row["column_default"] or "",
+                        constraints,
+                        row["description"] or "",
+                    ]
+                    for ci, val in enumerate(vals, 1):
+                        cell           = ws.cell(row=ri, column=ci, value=val)
+                        cell.border    = brd
+                        cell.alignment = Alignment(
+                            vertical="center",
+                            wrap_text=(ci in (9, 11)),
+                        )
+                        if ci == 10:
+                            if "PK" in constraints:
+                                cell.fill = pk_fill
+                            elif "FK" in constraints:
+                                cell.fill = fk_fill
+                    ws.row_dimensions[ri].height = 15
+
+                ws.freeze_panes = "A3"
+
+            wb.save(self.path)
+            self.finished.emit(self.path)
+
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ── Main browser window ────────────────────────────────────────────────────────
 
 class BrowserWindow(QWidget):
@@ -499,6 +689,8 @@ class BrowserWindow(QWidget):
         self.conn = conn
         self.params = params
         self._all_tables: list[tuple[str, str]] = []
+        self._dd_all_tables: list[tuple[str, str]] = []
+        self._dd_export_worker: DictExportWorker | None = None
         self._build_ui()
         self._load_schemas()
 
@@ -638,9 +830,19 @@ class BrowserWindow(QWidget):
 
         rv.addWidget(self.tabs)
         splitter.addWidget(right)
-
         splitter.setSizes([240, 960])
-        root.addWidget(splitter)
+
+        browse_tab = QWidget()
+        blt = QVBoxLayout(browse_tab)
+        blt.setContentsMargins(0, 0, 0, 0)
+        blt.setSpacing(0)
+        blt.addWidget(splitter)
+
+        self._main_tabs = QTabWidget()
+        self._main_tabs.setDocumentMode(True)
+        self._main_tabs.addTab(browse_tab, "Browse Tables")
+        self._main_tabs.addTab(self._build_dict_tab(), "Data Dictionary")
+        root.addWidget(self._main_tabs)
 
     @staticmethod
     def _make_table(headers: list[str]) -> QTableWidget:
@@ -960,6 +1162,242 @@ class BrowserWindow(QWidget):
                     item.setForeground(QColor("#89dceb"))
                 t.setItem(r, c, item)
         t.resizeColumnsToContents()
+
+    # ── Data Dictionary tab ────────────────────────────────────────────────────
+
+    def _build_dict_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+
+        # Title
+        title = QLabel("Data Dictionary Generator")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title.setStyleSheet("color: #cdd6f4; background: transparent;")
+        v.addWidget(title)
+
+        sub = QLabel(
+            "Load tables, select the ones to include, then generate an Excel file "
+            "with a dedicated sheet per table."
+        )
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color: #a6adc8; font-size: 12px; background: transparent;")
+        v.addWidget(sub)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("QFrame { color: #313244; background: #313244; }")
+        sep.setFixedHeight(1)
+        v.addWidget(sep)
+
+        # Search + Load row
+        sr = QHBoxLayout()
+        sr.setSpacing(8)
+        self.dd_search = QLineEdit()
+        self.dd_search.setPlaceholderText("🔍  Search tables…")
+        self.dd_search.textChanged.connect(self._dd_filter_tables)
+        sr.addWidget(self.dd_search)
+
+        self.dd_load_btn = QPushButton("Load Tables")
+        self.dd_load_btn.setFixedWidth(120)
+        self.dd_load_btn.clicked.connect(self._dd_load_tables)
+        sr.addWidget(self.dd_load_btn)
+        v.addLayout(sr)
+
+        # Select All / Deselect All + count
+        sel_row = QHBoxLayout()
+        sel_row.setSpacing(6)
+
+        sel_all_btn = QPushButton("Select All", objectName="secondary")
+        sel_all_btn.setFixedWidth(100)
+        sel_all_btn.clicked.connect(self._dd_select_all)
+        sel_row.addWidget(sel_all_btn)
+
+        desel_all_btn = QPushButton("Deselect All", objectName="secondary")
+        desel_all_btn.setFixedWidth(110)
+        desel_all_btn.clicked.connect(self._dd_deselect_all)
+        sel_row.addWidget(desel_all_btn)
+
+        sel_row.addStretch()
+
+        self.dd_sel_count = QLabel("0 selected")
+        self.dd_sel_count.setStyleSheet(
+            "color: #a6adc8; font-size: 12px; background: transparent;"
+        )
+        sel_row.addWidget(self.dd_sel_count)
+        v.addLayout(sel_row)
+
+        # Table list with checkboxes
+        self.dd_list = QListWidget()
+        self.dd_list.setAlternatingRowColors(True)
+        self.dd_list.itemChanged.connect(self._dd_on_item_changed)
+        v.addWidget(self.dd_list)
+
+        # Generate button row
+        gen_row = QHBoxLayout()
+        gen_row.setSpacing(10)
+
+        self.dd_gen_btn = QPushButton("⬇  Generate Excel")
+        self.dd_gen_btn.setFixedWidth(180)
+        self.dd_gen_btn.clicked.connect(self._dd_generate)
+        gen_row.addWidget(self.dd_gen_btn)
+
+        gen_row.addStretch()
+        v.addLayout(gen_row)
+
+        # Progress bar
+        self.dd_progress = QProgressBar()
+        self.dd_progress.setVisible(False)
+        self.dd_progress.setFixedHeight(6)
+        self.dd_progress.setTextVisible(False)
+        v.addWidget(self.dd_progress)
+
+        # Status label
+        self.dd_status = QLabel("")
+        self.dd_status.setWordWrap(True)
+        self.dd_status.setStyleSheet(
+            "color: #a6adc8; font-size: 12px; background: transparent;"
+        )
+        v.addWidget(self.dd_status)
+
+        return w
+
+    # ── DD helpers ─────────────────────────────────────────────────────────────
+
+    def _dd_load_tables(self):
+        schema = self.schema_combo.currentText()
+        if not schema:
+            return
+        self.dd_load_btn.setEnabled(False)
+        self.dd_status.setStyleSheet(
+            "color: #a6adc8; font-size: 12px; background: transparent;"
+        )
+        try:
+            rows = self._exec("""
+                SELECT table_name, table_type
+                FROM   information_schema.tables
+                WHERE  table_schema = %s
+                ORDER BY table_type DESC, table_name
+            """, (schema,))
+            self._dd_all_tables = [(r["table_name"], r["table_type"]) for r in rows]
+        except Exception as exc:
+            self.dd_status.setStyleSheet(
+                "color: #f38ba8; font-size: 12px; background: transparent;"
+            )
+            self.dd_status.setText(f"❌  Error loading tables: {exc}")
+            self.dd_load_btn.setEnabled(True)
+            return
+        self.dd_load_btn.setEnabled(True)
+        self.dd_search.clear()
+        self._dd_render_tables(self._dd_all_tables)
+        n = len(self._dd_all_tables)
+        self.dd_status.setText(
+            f"Loaded {n} object{'s' if n != 1 else ''} from schema '{schema}'"
+        )
+
+    def _dd_render_tables(self, tables: list):
+        self.dd_list.blockSignals(True)
+        self.dd_list.clear()
+        for name, ttype in tables:
+            icon = "▦ " if ttype == "BASE TABLE" else "◫ "
+            item = QListWidgetItem(icon + name)
+            item.setData(Qt.UserRole, name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            tip = "TABLE" if ttype == "BASE TABLE" else "VIEW"
+            item.setToolTip(tip)
+            self.dd_list.addItem(item)
+        self.dd_list.blockSignals(False)
+        self._dd_update_count()
+
+    def _dd_filter_tables(self, text: str):
+        lo = text.lower()
+        filtered = [(n, t) for n, t in self._dd_all_tables if lo in n.lower()]
+        self._dd_render_tables(filtered)
+
+    def _dd_select_all(self):
+        self.dd_list.blockSignals(True)
+        for i in range(self.dd_list.count()):
+            self.dd_list.item(i).setCheckState(Qt.Checked)
+        self.dd_list.blockSignals(False)
+        self._dd_update_count()
+
+    def _dd_deselect_all(self):
+        self.dd_list.blockSignals(True)
+        for i in range(self.dd_list.count()):
+            self.dd_list.item(i).setCheckState(Qt.Unchecked)
+        self.dd_list.blockSignals(False)
+        self._dd_update_count()
+
+    def _dd_on_item_changed(self, _item):
+        self._dd_update_count()
+
+    def _dd_update_count(self):
+        n = sum(
+            1 for i in range(self.dd_list.count())
+            if self.dd_list.item(i).checkState() == Qt.Checked
+        )
+        self.dd_sel_count.setText(f"{n} selected")
+
+    def _dd_generate(self):
+        selected = [
+            self.dd_list.item(i).data(Qt.UserRole)
+            for i in range(self.dd_list.count())
+            if self.dd_list.item(i).checkState() == Qt.Checked
+        ]
+        if not selected:
+            QMessageBox.warning(
+                self, "No Tables Selected",
+                "Please select at least one table before generating."
+            )
+            return
+
+        schema = self.schema_combo.currentText()
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Data Dictionary",
+            f"data_dictionary_{schema}.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        if not path.endswith(".xlsx"):
+            path += ".xlsx"
+
+        self.dd_gen_btn.setEnabled(False)
+        self.dd_progress.setRange(0, len(selected))
+        self.dd_progress.setValue(0)
+        self.dd_progress.setVisible(True)
+        self.dd_status.setStyleSheet(
+            "color: #a6adc8; font-size: 12px; background: transparent;"
+        )
+        self.dd_status.setText(f"Generating data dictionary for {len(selected)} table(s)…")
+
+        self._dd_export_worker = DictExportWorker(self.params, schema, selected, path)
+        self._dd_export_worker.progress.connect(self._dd_on_progress)
+        self._dd_export_worker.finished.connect(self._dd_on_finished)
+        self._dd_export_worker.error.connect(self._dd_on_error)
+        self._dd_export_worker.start()
+
+    def _dd_on_progress(self, current: int, total: int, name: str):
+        self.dd_progress.setValue(current)
+        self.dd_status.setText(f"Processing {current}/{total}: {name}")
+
+    def _dd_on_finished(self, path: str):
+        self.dd_gen_btn.setEnabled(True)
+        self.dd_progress.setVisible(False)
+        self.dd_status.setStyleSheet(
+            "color: #a6e3a1; font-size: 12px; background: transparent;"
+        )
+        self.dd_status.setText(f"✓  Saved: {path}")
+
+    def _dd_on_error(self, err: str):
+        self.dd_gen_btn.setEnabled(True)
+        self.dd_progress.setVisible(False)
+        self.dd_status.setStyleSheet(
+            "color: #f38ba8; font-size: 12px; background: transparent;"
+        )
+        self.dd_status.setText(f"❌  {err}")
 
     # ── Disconnect ─────────────────────────────────────────────────────────────
 
