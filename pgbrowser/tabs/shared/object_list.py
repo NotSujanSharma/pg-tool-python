@@ -8,19 +8,20 @@ Supports two selection modes:
 
 Usage
 -----
-# auto-loading (Browse tab style):
 panel = ObjectListPanel(conn, mode="single")
-panel.reload(schema)          # fetch and render immediately
+panel.reload(schema)          # fetch from DB and render
 
-# manual-loading (DataDict tab style):
-panel = ObjectListPanel(conn, mode="multi", show_load_btn=True)
-panel.set_schema(schema)      # store schema; user presses Load to fetch
+# Optionally let the user narrow the list by loading names from a file:
+# The "Load from file" button in the toolbar handles that automatically.
 """
+
+import csv
+import os
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QComboBox, QPushButton,
+    QComboBox, QPushButton, QFileDialog, QToolButton,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -55,14 +56,13 @@ class ObjectListPanel(QWidget):
         conn,
         *,
         mode: str = "single",
-        show_load_btn: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.conn           = conn
-        self._mode          = mode
-        self._show_load_btn = show_load_btn
+        self.conn       = conn
+        self._mode      = mode
         self._all_items: list[tuple[str, str]] = []
+        self._file_names: set[str] | None = None   # None = no file filter active
         self._schema: str = ""
         self._build_ui()
 
@@ -88,11 +88,44 @@ class ObjectListPanel(QWidget):
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
         lv.addWidget(self._type_combo)
 
-        # Text search
+        # Text search + Load-from-file button on same row
+        search_row = QHBoxLayout()
+        search_row.setSpacing(4)
+        search_row.setContentsMargins(0, 0, 0, 0)
+
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍  Filter…")
         self.search_edit.textChanged.connect(self._on_filter_changed)
-        lv.addWidget(self.search_edit)
+        search_row.addWidget(self.search_edit)
+
+        self._file_btn = QToolButton()
+        self._file_btn.setText("📂")
+        self._file_btn.setToolTip(
+            "Load table names from a .txt or .csv file.\n"
+            "Only those tables will be shown."
+        )
+        self._file_btn.setFixedSize(28, 28)
+        self._file_btn.clicked.connect(self._on_load_file)
+        search_row.addWidget(self._file_btn)
+
+        self._clear_file_btn = QToolButton()
+        self._clear_file_btn.setText("✕")
+        self._clear_file_btn.setToolTip("Clear file filter — show all")
+        self._clear_file_btn.setFixedSize(24, 28)
+        self._clear_file_btn.setVisible(False)
+        self._clear_file_btn.clicked.connect(self._on_clear_file)
+        search_row.addWidget(self._clear_file_btn)
+
+        lv.addLayout(search_row)
+
+        # File filter indicator
+        self._file_lbl = QLabel("")
+        self._file_lbl.setStyleSheet(
+            "color: #89b4fa; font-size: 10px; background: transparent;"
+        )
+        self._file_lbl.setVisible(False)
+        self._file_lbl.setWordWrap(True)
+        lv.addWidget(self._file_lbl)
 
         # Select All / Deselect All (multi mode only)
         if self._mode == "multi":
@@ -113,13 +146,7 @@ class ObjectListPanel(QWidget):
             sel_row.addStretch()
             lv.addLayout(sel_row)
 
-        # Load button (shown when show_load_btn=True)
-        if self._show_load_btn:
-            self._load_btn = QPushButton("Load")
-            self._load_btn.clicked.connect(self._on_load_clicked)
-            lv.addWidget(self._load_btn)
-
-        # Object list
+        # Object list — no alternating row colors (theme handles item bg)
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
         if self._mode == "multi":
@@ -144,18 +171,13 @@ class ObjectListPanel(QWidget):
         self._all_items = [(r["table_name"], r["table_type"]) for r in rows]
         self._render(self._visible_items())
 
-    def set_schema(self, schema: str) -> None:
-        """Store *schema* without fetching — user must press Load."""
-        self._schema = schema
-        self._all_items = []
-        self.search_edit.clear()
-        self.list_widget.clear()
-        self.count_lbl.setText("")
-
     def clear(self) -> None:
         """Clear everything including the stored schema."""
         self._schema = ""
         self._all_items = []
+        self._file_names = None
+        self._file_lbl.setVisible(False)
+        self._clear_file_btn.setVisible(False)
         self.search_edit.clear()
         self.list_widget.clear()
         self.count_lbl.setText("")
@@ -178,7 +200,9 @@ class ObjectListPanel(QWidget):
         txt = self.search_edit.text().lower()
         return [
             (n, t) for n, t in self._all_items
-            if (tf == "ALL" or t == tf) and txt in n.lower()
+            if (tf == "ALL" or t == tf)
+            and txt in n.lower()
+            and (self._file_names is None or n in self._file_names)
         ]
 
     def _render(self, items: list[tuple[str, str]]) -> None:
@@ -206,9 +230,52 @@ class ObjectListPanel(QWidget):
     def _on_filter_changed(self, _text: str) -> None:
         self._render(self._visible_items())
 
-    def _on_load_clicked(self) -> None:
-        if self._schema:
-            self.reload(self._schema)
+    def _on_load_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load table list from file",
+            "",
+            "Text / CSV files (*.txt *.csv);;All files (*)",
+        )
+        if not path:
+            return
+        names = self._read_names_from_file(path)
+        if names is None:
+            return
+        self._file_names = names
+        fname = os.path.basename(path)
+        self._file_lbl.setText(f"📄 {fname}  ({len(names)} names)")
+        self._file_lbl.setVisible(True)
+        self._clear_file_btn.setVisible(True)
+        self._render(self._visible_items())
+
+    def _on_clear_file(self) -> None:
+        self._file_names = None
+        self._file_lbl.setVisible(False)
+        self._clear_file_btn.setVisible(False)
+        self._render(self._visible_items())
+
+    @staticmethod
+    def _read_names_from_file(path: str) -> set[str] | None:
+        """Parse a .txt (one name per line) or .csv (first column) file."""
+        names: set[str] = set()
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                if path.lower().endswith(".csv"):
+                    reader = csv.reader(fh)
+                    for row in reader:
+                        if row:
+                            name = row[0].strip()
+                            if name:
+                                names.add(name)
+                else:
+                    for line in fh:
+                        name = line.strip()
+                        if name:
+                            names.add(name)
+        except OSError:
+            return None
+        return names
 
     def _select_all(self) -> None:
         self.list_widget.blockSignals(True)

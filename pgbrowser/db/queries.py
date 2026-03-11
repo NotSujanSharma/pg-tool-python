@@ -191,7 +191,7 @@ def get_columns_for_export(conn, schema: str, table: str) -> list:
             AND kcu.table_name        = tc.table_name
         LEFT JOIN pg_catalog.pg_description d
             ON  d.objoid = (
-                    SELECT oid FROM pg_class
+                    SELECT pg_class.oid FROM pg_class
                     JOIN   pg_namespace
                            ON pg_namespace.oid = pg_class.relnamespace
                     WHERE  pg_class.relname    = %s

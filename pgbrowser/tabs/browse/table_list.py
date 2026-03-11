@@ -22,6 +22,6 @@ class TableListPanel(ObjectListPanel):
     table_selected = pyqtSignal(str, str)
 
     def __init__(self, conn, parent=None):
-        super().__init__(conn, mode="single", show_load_btn=False, parent=parent)
+        super().__init__(conn, mode="single", parent=parent)
         self.item_selected.connect(self.table_selected)
 

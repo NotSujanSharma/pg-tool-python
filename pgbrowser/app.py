@@ -7,6 +7,7 @@ import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QMessageBox,
 )
+from PyQt5.QtCore import Qt
 
 from pgbrowser.db.connection import HAS_PSYCOPG2
 from pgbrowser.theme import STYLESHEET
@@ -58,6 +59,8 @@ class AppShell(QMainWindow):
 
 
 def main() -> None:
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setApplicationName("PG Browser")
     app.setApplicationDisplayName("PG Browser")

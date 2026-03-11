@@ -3,7 +3,7 @@ Data Dictionary Generator tab.
 
 Layout
 ------
-Left  — ObjectListPanel (multi-select, manual Load)
+Left  — ObjectListPanel (multi-select, auto-loads on schema change)
 Right — top: Generate controls
         middle: scrollable output log
         bottom: Save As… button
@@ -49,7 +49,6 @@ class DataDictTab(BaseTab):
         self._object_list = ObjectListPanel(
             self.conn,
             mode="multi",
-            show_load_btn=True,
         )
         self._object_list.setMinimumWidth(180)
         self._object_list.setMaximumWidth(340)
@@ -156,10 +155,10 @@ class DataDictTab(BaseTab):
     # ── BaseTab hooks ──────────────────────────────────────────────────────────
 
     def on_schema_changed(self, schema: str) -> None:
-        self._object_list.set_schema(schema)
         self._reset_right_panel()
         if schema:
-            self._log(f"Schema changed to '{schema}'. Use Load to refresh the list.", "#a6adc8")
+            self._object_list.reload(schema)
+            self._log(f"Loaded objects for schema '{schema}'.", "#a6adc8")
 
     def on_disconnected(self) -> None:
         if self._export_worker and self._export_worker.isRunning():

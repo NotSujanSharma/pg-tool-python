@@ -121,6 +121,7 @@ QListWidget {
     border: none;
     outline: none;
     padding: 4px 2px;
+    alternate-background-color: #1e1e2e;
 }
 QListWidget::item {
     padding: 7px 12px;
