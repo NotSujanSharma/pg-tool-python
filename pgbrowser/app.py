@@ -7,7 +7,7 @@ import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QMessageBox,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QEvent
 
 from pgbrowser.db.connection import HAS_PSYCOPG2
 from pgbrowser.theme import STYLESHEET
@@ -39,6 +39,38 @@ class AppShell(QMainWindow):
                 "Missing dependency",
                 "psycopg2 is not installed.\n\nRun:  pip install psycopg2-binary",
             )
+
+        # ── Zoom (Ctrl + Plus / Ctrl + =) ──
+        # Base font size must match the QWidget font-size in STYLESHEET.
+        self._zoom_size = 13
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.KeyPress:
+            if event.modifiers() & Qt.ControlModifier:
+                if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+                    self._zoom_in()
+                    return True
+                if event.key() == Qt.Key_Minus:
+                    self._zoom_out()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _zoom_in(self):
+        self._zoom_size = min(self._zoom_size + 1, 28)
+        new_sheet = STYLESHEET.replace(
+            "font-size: 13px;",
+            f"font-size: {self._zoom_size}px;",
+        )
+        QApplication.instance().setStyleSheet(new_sheet)
+
+    def _zoom_out(self):
+        self._zoom_size = max(self._zoom_size - 1, 8)
+        new_sheet = STYLESHEET.replace(
+            "font-size: 13px;",
+            f"font-size: {self._zoom_size}px;",
+        )
+        QApplication.instance().setStyleSheet(new_sheet)
 
     def _on_connected(self, conn, params: dict) -> None:
         if self._browser is not None:
