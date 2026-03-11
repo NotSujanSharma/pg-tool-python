@@ -64,6 +64,7 @@ class ObjectListPanel(QWidget):
         self._all_items: list[tuple[str, str]] = []
         self._file_names: set[str] | None = None   # None = no file filter active
         self._schema: str = ""
+        self._checked_names: set[str] = set() if mode == "multi" else None
         self._build_ui()
 
     # ── UI construction ────────────────────────────────────────────────────────
@@ -176,6 +177,8 @@ class ObjectListPanel(QWidget):
         self._schema = ""
         self._all_items = []
         self._file_names = None
+        if self._mode == "multi":
+            self._checked_names.clear()
         self._file_lbl.setVisible(False)
         self._clear_file_btn.setVisible(False)
         self.search_edit.clear()
@@ -217,7 +220,11 @@ class ObjectListPanel(QWidget):
             item.setToolTip("TABLE" if ttype == "BASE TABLE" else "VIEW")
             if self._mode == "multi":
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
+                # Restore checked state from global set
+                if name in self._checked_names:
+                    item.setCheckState(Qt.Checked)
+                else:
+                    item.setCheckState(Qt.Unchecked)
             self.list_widget.addItem(item)
         if self._mode == "multi":
             self.list_widget.blockSignals(False)
@@ -280,18 +287,29 @@ class ObjectListPanel(QWidget):
     def _select_all(self) -> None:
         self.list_widget.blockSignals(True)
         for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(Qt.Checked)
+            item = self.list_widget.item(i)
+            item.setCheckState(Qt.Checked)
+            name = item.data(Qt.UserRole + 1)
+            self._checked_names.add(name)
         self.list_widget.blockSignals(False)
         self.selection_changed.emit(self.selected_names())
 
     def _deselect_all(self) -> None:
         self.list_widget.blockSignals(True)
         for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(Qt.Unchecked)
+            item = self.list_widget.item(i)
+            item.setCheckState(Qt.Unchecked)
+            name = item.data(Qt.UserRole + 1)
+            self._checked_names.discard(name)
         self.list_widget.blockSignals(False)
         self.selection_changed.emit(self.selected_names())
 
-    def _on_item_changed(self, _item) -> None:
+    def _on_item_changed(self, item) -> None:
+        name = item.data(Qt.UserRole + 1)
+        if item.checkState() == Qt.Checked:
+            self._checked_names.add(name)
+        else:
+            self._checked_names.discard(name)
         self.selection_changed.emit(self.selected_names())
 
     def _on_current_changed(self, current, _previous) -> None:
