@@ -152,6 +152,7 @@ class ObjectListPanel(QWidget):
         self.list_widget.setAlternatingRowColors(True)
         if self._mode == "multi":
             self.list_widget.itemChanged.connect(self._on_item_changed)
+            self.list_widget.itemClicked.connect(self._on_item_clicked)
         else:
             self.list_widget.currentItemChanged.connect(self._on_current_changed)
         lv.addWidget(self.list_widget)
@@ -319,3 +320,9 @@ class ObjectListPanel(QWidget):
         ttype = current.data(Qt.UserRole)
         if name:
             self.item_selected.emit(name, ttype)
+
+    def _on_item_clicked(self, item):
+        if item.checkState() == Qt.Checked:
+            item.setCheckState(Qt.Unchecked)
+        else:
+            item.setCheckState(Qt.Checked)
